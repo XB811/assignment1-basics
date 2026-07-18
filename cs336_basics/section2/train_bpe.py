@@ -20,14 +20,24 @@ def train_bpe(
     params = [(input_path, pattern, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
     with Pool(num_processes) as pool:
         results = pool.starmap(handel_chunk, params)
-    merge_frequency_table: dict[tuple[bytes, ...], int] = {}
+    # 合并统计结果
+    pre_token_frequency_table = {}
     for result in results:
         for key, count in result.items():
-            merge_frequency_table[key] = merge_frequency_table.get(key, 0) + count
-    print(merge_frequency_table.keys().__len__())
+            pre_token_frequency_table[key] = pre_token_frequency_table.get(key, 0) + count
+    print(pre_token_frequency_table.keys().__len__())
+    merges_pair = pair_table(pre_token_frequency_table)
+    for pair_x, pair_y in merges_pair:
+        vocab[len(vocab)] = pair_x + pair_y
+    return vocab, merges_pair
 
+def pair_table(pre_token_frequency_table) -> list[tuple[bytes , bytes]]:
+    """
+    预分词后，真正的bpe处理逻辑
+    """
+    merges_pair = []
 
-    return tuple(vocab, None)
+    return merges_pair
 
 def handel_chunk(
         input_path: str | os.PathLike,
@@ -36,6 +46,9 @@ def handel_chunk(
         end: int,
         **kwargs,
 ) -> dict[tuple[bytes, ...], int]:
+    """
+    文件分块后，对每块进行字符统计
+    """
     frequency_table : dict[tuple[bytes, ...], int] = {}
     with (open(input_path, "rb") as f):
         f.seek(start)
@@ -105,12 +118,7 @@ def _base_vocab(
     """
     vocab = dict[int, bytes]()
     for tokens in special_tokens:
-        _add_char(vocab, tokens.encode('utf_8'))
+        vocab[len(vocab)] =  tokens.encode('utf_8')
     for i in range(256):
-        _add_char(vocab, bytes([i]))
+        vocab[len(vocab)] = bytes([i])
     return vocab
-def _add_char(
-        vocab: dict[int, bytes],
-        char: bytes
-):
-    vocab[len(vocab)] = char
