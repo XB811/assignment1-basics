@@ -1,9 +1,17 @@
+from __future__ import annotations
+
 import os
+import pickle
+import time
 from collections import Counter, defaultdict
+from datetime import datetime
 from typing import BinaryIO
 import regex as re
 import heapq
 from multiprocessing import Pool
+
+from tqdm import tqdm
+
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 class MaxHeapItem:
@@ -279,3 +287,30 @@ def _base_vocab(
     for i in range(256):
         vocab[len(vocab)] = bytes([i])
     return vocab
+
+
+
+def save_vocab(vocab: dict[int, bytes], output_path: str | os.PathLike):
+    with open(output_path, "wb") as f:
+        pickle.dump(vocab, f)
+
+def save_merges(merges: list[tuple[bytes,bytes]], output_path: str | os.PathLike):
+    with open(output_path, "wb") as f:
+        pickle.dump(merges, f)
+
+def main():
+    input_path = "data/TinyStoriesV2-GPT4-train.txt"
+    vocab_size = 10000
+    special_tokens = ["<|endoftext|>"]
+    num_processes = 28
+
+    start = datetime.now()
+    vocab, merges = train_bpe(input_path, vocab_size, special_tokens, num_processes)
+    end = datetime.now()
+    tqdm.write("time: {}".format(end - start))
+    tqdm.write("Saving outputs")
+    save_vocab(vocab, "data/tinystories_vocab.pkl")
+    save_merges(merges, "data/tinystories_merges.pkl")
+
+if __name__ == "__main__":
+    main()
