@@ -6,6 +6,21 @@ import heapq
 from multiprocessing import Pool
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+class MaxHeapItem:
+    def __init__(self, b1:bytes,b2:bytes, count:int):
+        self.b1 = b1
+        self.b2 = b2
+        self.count = count
+
+    def __lt__(self, other):
+        if self.count != other.count:
+            return self.count > other.count
+        elif self.b1 != other.b1:
+            return self.b1 > other.b1
+        return self.b2 > other.b2
+    def get_tuple(self) -> tuple[bytes, bytes]:
+        return self.b1, self.b2
+
 def train_bpe(
         input_path: str | os.PathLike,
         vocab_size: int,
@@ -23,23 +38,107 @@ def train_bpe(
     with Pool(num_processes) as pool:
         results = pool.starmap(handel_chunk, params)
     # 合并统计结果
-    pre_token_frequency_table = Counter[tuple[bytes, ...]]
+    pre_token_frequency_table = Counter()
     for result in results:
         pre_token_frequency_table.update(result)
-    merges_pair = pair_table(pre_token_frequency_table)
+    merges_pair = pair_table(pre_token_frequency_table = pre_token_frequency_table,  num_merges=vocab_size - len(vocab))
     for pair_x, pair_y in merges_pair:
         vocab[len(vocab)] = pair_x + pair_y
     return vocab, merges_pair
 
-def pair_table(pre_token_frequency_table :Counter[tuple[bytes, ...]]
-) -> list[tuple[bytes , bytes]]:
+def pair_table(pre_token_frequency_table :Counter[tuple[bytes, ...]],
+               num_merges) -> list[tuple[bytes , bytes]]:
     """
     预分词后，真正的bpe处理逻辑
     """
     merges_pair : list[tuple[bytes , bytes]] = []
     pair_counts, pair_to_words, pair_heap = init_pair_index(pre_token_frequency_table)
+    for _ in range(num_merges):
+        if not pair_counts:
+            break
+        # 选择出现频次最高的 pair 进行合并
+        best_pair, best_pair_count = pop_heap_top_pairs(pair_heap)
+        if best_pair is None or best_pair_count is None:
+            break
+        while pair_counts[best_pair] != best_pair_count:
+            best_pair, best_pair_count = pop_heap_top_pairs(pair_heap)
+            if best_pair is None or best_pair_count is None:
+                break
+        # print("111 ",len(merges_pair)," ",best_pair, best_pair_count , pair_heap[0].get_tuple(), pair_heap[0].count)
+        merges_pair.append(best_pair)
+        pre_token_frequency_table, pair_counts, pair_to_words,pair_heap = apply_merge(pre_token_frequency_table, pair_counts, pair_to_words, pair_heap, best_pair)
+        # print("222 ",  pair_heap[0].get_tuple(), pair_heap[0].count)
     return merges_pair
 
+def apply_merge(pre_token_frequency_table, pair_counts, pair_to_words, pair_heap, best_pair):
+    # 要处理的词
+    affected_words = list(pair_to_words.get(best_pair, {}).keys())
+    if not affected_words:
+        return pre_token_frequency_table, pair_counts, pair_to_words, pair_heap
+    # {预分词：预分词数量}
+    affected_words_count = {word: pre_token_frequency_table[word] for word in affected_words}
+    changed_pairs = set()
+    for old_word in affected_words:
+        # 预分词数量
+        pre_token_frequency_count = affected_words_count[old_word]
+        # 返回一个词内部所有相邻 pair 的频次
+        old_word_pair = pairs_in_word(old_word)
+        # 中间数据 pair_counts pair_to_words 减去old_word 的所能构成的pair的数量
+        for pair, counts in old_word_pair.items():
+            changed_pairs.add(pair)
+            pair_counts[pair] -= counts * pre_token_frequency_count
+            if pair_counts[pair] <= 0:
+                del pair_counts[pair]
+
+            pair_to_words[pair][old_word] -= 1
+            if pair_to_words[pair][old_word] <= 0:
+                del pair_to_words[pair][old_word]
+            if not pair_to_words[pair]:
+                del pair_to_words[pair]
+        # pre_token_frequency_table 关于预分词old_word 的数量删除
+        pre_token_frequency_table[old_word] -= pre_token_frequency_count
+        if pre_token_frequency_table[old_word] <= 0:
+            del pre_token_frequency_table[old_word]
+
+        new_word = merge_word(old_word, best_pair)
+
+        pre_token_frequency_table[new_word] += pre_token_frequency_count
+
+        new_pair_counts = pairs_in_word(new_word)
+        for pair, counts in new_pair_counts.items():
+            changed_pairs.add(pair)
+            pair_counts[pair] += pre_token_frequency_count * counts
+            pair_to_words[pair][new_word] += 1
+    # 4. 由于heap 不能删除旧数据，每次更新又会涉及多个word
+    # 为避免塞入脏数据，所以只能在所有预分词更新完成之后，再去更新heap中的pair_count
+    for pair in changed_pairs:
+        final_count = pair_counts.get(pair, 0)
+
+        if final_count > 0:
+            update_max_heap_pairs(
+                pair_heap,
+                pair[0],
+                pair[1],
+                final_count,
+            )
+    return pre_token_frequency_table, pair_counts, pair_to_words, pair_heap
+    pass
+def merge_word(word: tuple[bytes, ...], best_pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
+    """
+    合并预分词
+    """
+    merged_token = best_pair[0] + best_pair[1]
+    new_word = []
+    i = 0
+    n = len(word)
+    while i < n:
+        if i < n - 1 and (word[i], word[i + 1]) == best_pair:
+            new_word.append(merged_token)
+            i += 2
+        else:
+            new_word.append(word[i])
+            i += 1
+    return tuple(new_word)
 def init_pair_index(pre_token_frequency_table : Counter[tuple[bytes, ...]]):
     """
     构建：
@@ -49,12 +148,12 @@ def init_pair_index(pre_token_frequency_table : Counter[tuple[bytes, ...]]):
        不同旧词 merge 后变成同一个 new_word 的碰撞情况
     3、pair_heap pair最大堆，先按照count排序，再按照字典序排序
     """
-    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    pair_counts = Counter()
     pair_to_words = defaultdict(Counter)
-    for word, freq in pre_token_frequency_table.items():
+    for word, count in pre_token_frequency_table.items():
         word_pair_counts = pairs_in_word(word)
         for pair, multiplicity in word_pair_counts.items():
-            pair_counts[pair] += multiplicity * freq
+            pair_counts[pair] += multiplicity * count
             pair_to_words[pair][word] += 1
     pair_heap = get_max_heap_pairs(pair_counts)
     return pair_counts, pair_to_words,pair_heap
@@ -68,6 +167,10 @@ def pairs_in_word(word:tuple[bytes, ...]) -> Counter[tuple[bytes, bytes]]:
     if len(word) < 2:
         return Counter()
     return Counter(zip(word, word[1:]))
+def pair_list_in_word(word:tuple[bytes, ...]) -> list[tuple[bytes, bytes]]:
+    if len(word) < 2:
+        return []
+    return list(zip(word, word[1:]))
 def get_max_heap_pairs(pair_counts: Counter[tuple[bytes, bytes]]):
     """
     将 Counter 转换为最大堆，排序规则：
@@ -77,9 +180,7 @@ def get_max_heap_pairs(pair_counts: Counter[tuple[bytes, bytes]]):
     heap = []
 
     for (b1, b2), count in pair_counts.items():
-        # 构造堆元素: (-频次, ~bytes1, ~bytes2, 原始tuple)
-        # 注意：bytes 支持按位取反，返回的仍是 bytes 对象，且保持字典序反转的特性
-        heap_item = (-count, ~b1, ~b2, (b1, b2))
+        heap_item = MaxHeapItem(b1, b2, count)
         heapq.heappush(heap, heap_item)
 
     return heap
@@ -87,13 +188,14 @@ def update_max_heap_pairs(heap, b1:bytes,b2:bytes, count:int):
     """
     新增pairs
     """
-    heap_item = (-count, ~b1, ~b2, (b1, b2))
+    heap_item = MaxHeapItem(b1, b2, count)
     heapq.heappush(heap, heap_item)
-def pop_sorted_pairs(heap):
-    """从堆中依次弹出，还原为 (pair, count) 的生成器"""
-    while heap:
-        neg_count, _, _, pair = heapq.heappop(heap)
-        yield pair, -neg_count
+def pop_heap_top_pairs(heap: list[MaxHeapItem]) -> tuple[tuple[bytes, bytes], int]:
+    """从堆中弹出，还原为 (pair, count) """
+    if heap:
+        heap_item = heapq.heappop(heap)
+        return heap_item.get_tuple(), heap_item.count
+    return None, None
 def handel_chunk(
         input_path: str | os.PathLike,
         pattern: str,
