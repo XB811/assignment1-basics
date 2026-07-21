@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import cProfile
 import os
 import pickle
-import time
+import pstats
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import BinaryIO
+from pathlib import Path
+from typing import BinaryIO, TextIO
 import regex as re
 import heapq
 from multiprocessing import Pool
@@ -13,7 +16,7 @@ from multiprocessing import Pool
 from tqdm import tqdm
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
+BYTE_SYMBOLS: tuple[bytes, ...] = tuple(bytes((i,)) for i in range(256))
 class MaxHeapItem:
     def __init__(self, b1:bytes,b2:bytes, count:int):
         self.b1 = b1
@@ -34,6 +37,7 @@ def train_bpe(
         vocab_size: int,
         special_tokens: list[str],
         num_processes : int = 1,
+        worker_profile_dir: str | os.PathLike | None = None,
         **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes  , bytes]]]:
     vocab = _base_vocab(special_tokens)
@@ -44,7 +48,16 @@ def train_bpe(
     pattern = "|".join(re.escape(tok) for tok in special_tokens)
     params = [(input_path, pattern, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
     with Pool(num_processes) as pool:
-        results = pool.starmap(handel_chunk, params)
+        if worker_profile_dir is None:
+            results = pool.starmap(handel_chunk, params)
+        else:
+            resolved_profile_dir = Path(worker_profile_dir).resolve()
+            resolved_profile_dir.mkdir(parents=True, exist_ok=True)
+            profiled_params = [
+                (*param, str(resolved_profile_dir))
+                for param in params
+            ]
+            results = pool.starmap(profiled_handel_chunk, profiled_params)
     # 合并统计结果
     pre_token_frequency_table = Counter()
     for result in results:
@@ -219,13 +232,42 @@ def handel_chunk(
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         # 先剔除特殊字符
-        remove_special_token_chunks = re.split(pattern, chunk)
-        for one_chunk in remove_special_token_chunks:
-            for match in re.finditer(PAT, one_chunk):
-                bytes_str = match.group().encode('utf_8')
-                pieces = tuple(bytes([x]) for x in bytes_str)
-                frequency_table[pieces] +=1
+        pre_token_counts: Counter[str] = Counter()
+
+        special_pattern = re.compile(pattern)
+        pre_token_pattern = re.compile(PAT)
+
+        for one_chunk in special_pattern.split(chunk):
+            pre_token_counts.update(
+                match.group()
+                for match in pre_token_pattern.finditer(one_chunk)
+            )
+
+        frequency_table = Counter({
+            tuple(BYTE_SYMBOLS[x] for x in token.encode("utf-8")): count
+            for token, count in pre_token_counts.items()
+        })
     return frequency_table
+
+
+def profiled_handel_chunk(
+        input_path: str | os.PathLike,
+        pattern: str,
+        start: int,
+        end: int,
+        profile_dir: str | os.PathLike,
+) -> Counter[tuple[bytes, ...]]:
+    """Profile one worker task and retain its result unchanged."""
+    profiler = cProfile.Profile()
+    profile_path = (
+        Path(profile_dir)
+        / f"worker_{os.getpid()}_{start}_{end}.prof"
+    )
+
+    try:
+        return profiler.runcall(handel_chunk, input_path, pattern, start, end)
+    finally:
+        profiler.dump_stats(str(profile_path))
 
 
 def find_chunk_boundaries(
@@ -298,19 +340,147 @@ def save_merges(merges: list[tuple[bytes,bytes]], output_path: str | os.PathLike
     with open(output_path, "wb") as f:
         pickle.dump(merges, f)
 
-def main():
+def main(worker_profile_dir: str | os.PathLike | None = None):
     input_path = "data/TinyStoriesV2-GPT4-train.txt"
     vocab_size = 10000
     special_tokens = ["<|endoftext|>"]
     num_processes = 28
 
     start = datetime.now()
-    vocab, merges = train_bpe(input_path, vocab_size, special_tokens, num_processes)
+    vocab, merges = train_bpe(
+        input_path,
+        vocab_size,
+        special_tokens,
+        num_processes,
+        worker_profile_dir=worker_profile_dir,
+    )
     end = datetime.now()
-    tqdm.write("time: {}".format(end - start))
+    tqdm.write(f"time: {end - start}")
     tqdm.write("Saving outputs")
     save_vocab(vocab, "data/tinystories_vocab.pkl")
     save_merges(merges, "data/tinystories_merges.pkl")
 
+
+def merge_worker_profiles(
+        profile_dir: str | os.PathLike,
+        output_path: str | os.PathLike,
+        stream: TextIO | None = None,
+) -> int:
+    """Merge per-task profiles and return the number of merged files."""
+    profile_paths = sorted(Path(profile_dir).glob("*.prof"))
+    if not profile_paths:
+        return 0
+
+    if stream is not None:
+        stream.write("Per-task worker profile totals:\n")
+        for profile_path in profile_paths:
+            task_stats = pstats.Stats(str(profile_path), stream=stream)
+            stream.write(f"{profile_path.name}: {task_stats.total_tt:.6f} seconds\n")
+        stream.write(
+            "\nMerged times below are sums across workers, not wall-clock time.\n\n"
+        )
+
+    stats = pstats.Stats(str(profile_paths[0]), stream=stream)
+    for profile_path in profile_paths[1:]:
+        stats.add(str(profile_path))
+
+    stats.strip_dirs().sort_stats("cumulative")
+    stats.dump_stats(str(output_path))
+    if stream is not None:
+        stats.print_stats()
+    return len(profile_paths)
+
+
+def run_with_profile(profile_dir: str | os.PathLike = "profiles"):
+    """Run training and retain both machine-readable and text profile reports."""
+    output_dir = Path(profile_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    profile_path = output_dir / f"train_bpe_{timestamp}.prof"
+    log_path = output_dir / f"train_bpe_{timestamp}.log"
+    worker_profile_dir = output_dir / f"workers_{timestamp}"
+    worker_profile_path = output_dir / f"train_bpe_workers_{timestamp}.prof"
+    worker_log_path = output_dir / f"train_bpe_workers_{timestamp}.log"
+
+    profiler = cProfile.Profile()
+    started_at = datetime.now()
+    error: BaseException | None = None
+
+    try:
+        profiler.runcall(main, worker_profile_dir)
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        finished_at = datetime.now()
+        profiler.dump_stats(profile_path)
+
+        worker_profile_count = 0
+        worker_profile_error: Exception | None = None
+        try:
+            with worker_log_path.open("w", encoding="utf-8") as worker_log_file:
+                worker_profile_count = merge_worker_profiles(
+                    worker_profile_dir,
+                    worker_profile_path,
+                    stream=worker_log_file,
+                )
+        except Exception as exc:
+            worker_profile_error = exc
+
+        with log_path.open("w", encoding="utf-8") as log_file:
+            log_file.write(f"Started: {started_at.isoformat()}\n")
+            log_file.write(f"Finished: {finished_at.isoformat()}\n")
+            log_file.write(f"Elapsed: {finished_at - started_at}\n")
+            if error is None:
+                log_file.write("Status: completed\n")
+            else:
+                log_file.write(f"Status: failed ({type(error).__name__}: {error})\n")
+            log_file.write(f"Profile data: {profile_path.resolve()}\n")
+            log_file.write(
+                f"Worker profiles: {worker_profile_dir.resolve()} "
+                f"({worker_profile_count} files)\n"
+            )
+            if worker_profile_count:
+                log_file.write(
+                    f"Merged worker profile: {worker_profile_path.resolve()}\n"
+                )
+                log_file.write(
+                    f"Merged worker log: {worker_log_path.resolve()}\n"
+                )
+            if worker_profile_error is not None:
+                log_file.write(
+                    "Worker profile merge failed: "
+                    f"{type(worker_profile_error).__name__}: {worker_profile_error}\n"
+                )
+            log_file.write("\n")
+
+            pstats.Stats(profiler, stream=log_file).strip_dirs().sort_stats("cumulative").print_stats()
+
+        tqdm.write(f"Profile data saved to {profile_path.resolve()}")
+        tqdm.write(f"Profile log saved to {log_path.resolve()}")
+        if worker_profile_count:
+            tqdm.write(
+                f"Merged worker profile saved to {worker_profile_path.resolve()}"
+            )
+            tqdm.write(
+                f"Merged worker profile log saved to {worker_log_path.resolve()}"
+            )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a byte-pair encoding tokenizer.")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="profile the training run and save reports under profiles/",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.profile:
+        run_with_profile()
+    else:
+        main()
