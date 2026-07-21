@@ -238,10 +238,7 @@ def handel_chunk(
         pre_token_pattern = re.compile(PAT)
 
         for one_chunk in special_pattern.split(chunk):
-            pre_token_counts.update(
-                match.group()
-                for match in pre_token_pattern.finditer(one_chunk)
-            )
+            pre_token_counts.update(pre_token_pattern.findall(one_chunk))
 
         frequency_table = Counter({
             tuple(BYTE_SYMBOLS[x] for x in token.encode("utf-8")): count
@@ -344,7 +341,7 @@ def main(worker_profile_dir: str | os.PathLike | None = None):
     input_path = "data/TinyStoriesV2-GPT4-train.txt"
     vocab_size = 10000
     special_tokens = ["<|endoftext|>"]
-    num_processes = 28
+    num_processes = 16
 
     start = datetime.now()
     vocab, merges = train_bpe(
