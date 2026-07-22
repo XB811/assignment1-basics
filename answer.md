@@ -166,7 +166,7 @@ special_pattern = re.compile(pattern)
 pre_token_pattern = re.compile(PAT)
 ```
 
-优化4：批量预分词，减少match.group()
+**优化4：**批量预分词，减少match.group()
 
 ```
 pre_token_counts.update(pre_token_pattern.findall(one_chunk))
@@ -192,6 +192,14 @@ time: 0:00:21.047626
 Saving outputs
 ```
 
+**剩余优化点：**apply_merge对被关联的word能构成的pair全部进行了更新操作，可以只更新`best_pair` 及其相邻的pair的count和heap。既能减少pair更新操作次数，还能减少heap中重复的pair，提高heap查询效率。
+
+最终版的性能分析报告：
+
+![image-20260723001513067](https://qnimg.xblog1.top/typora/image-20260723001513067.png)
+
 #### 问题（train_bpe_expts_owt）：在 OpenWebText 上进行 BPE 训练实验（2 分）
 
 报错 MemoryError，本地跑不了
+
+#### 2.6 BPE 分词器：编码与解码
